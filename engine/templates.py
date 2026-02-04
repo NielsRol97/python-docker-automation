@@ -1,5 +1,5 @@
 def docker_compose_yml(project_name: str) -> str:
-    return """
+    return f"""
 services:
   app:
     build:
@@ -9,7 +9,8 @@ services:
     volumes:
       - ./:/var/www/html
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     networks:
       - laravel
 
@@ -21,7 +22,8 @@ services:
       - ./:/var/www/html
       - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - app
+      app:
+        condition: service_started
     networks:
       - laravel
 
@@ -31,16 +33,18 @@ services:
       MYSQL_DATABASE: laravel
       MYSQL_USER: laravel
       MYSQL_PASSWORD: secret
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: secret
     ports:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      # First-run safe, credential-aware healthcheck
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD || exit 1"]
       interval: 5s
-      timeout: 3s
-      retries: 10
+      timeout: 5s
+      retries: 20
+      start_period: 60s
     networks:
       - laravel
 
@@ -76,9 +80,6 @@ networks:
 """
 
 
-
-
-
 def nginx_default_conf() -> str:
     return r"""server {
   listen 80;
@@ -107,7 +108,6 @@ def nginx_default_conf() -> str:
 
 
 def php_dockerfile() -> str:
-    # Minimal but sane PHP-FPM image for Laravel
     return r"""FROM php:8.3-fpm-alpine
 
 # System deps
@@ -139,7 +139,6 @@ COPY docker/php/zz-overrides.ini /usr/local/etc/php/conf.d/zz-overrides.ini
 
 WORKDIR /var/www/html
 
-# Optional: keep container running even if no command is provided (php-fpm default)
 CMD ["php-fpm"]
 """
 

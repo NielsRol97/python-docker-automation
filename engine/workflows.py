@@ -13,6 +13,7 @@ from engine.docker import (
 from engine.artisan import artisan
 from engine.app import wait_for_service_healthy
 from engine.safety import require_confirmation, SafetyContext
+from engine.laravel_sail import sail_installed, install_sail
 
 
 # -------------------------------------------------
@@ -61,16 +62,24 @@ def start_environment(
     project: Path,
     *,
     auto_migrate: bool = True,
+    ensure_sail: bool = False,
     wait_for_health: bool = True,
     health_service: str = "mysql",
     health_timeout: int = 60,
 ) -> WorkflowResult:
     """
-    Start the Docker environment and optionally run migrations.
+    Start the Docker environment and optionally:
+    - wait for service health
+    - install Laravel Sail if missing
+    - run migrations
+
+    Order is important and intentional.
     """
     steps: list[str] = []
 
+    # -------------------------------------------------
     # Docker up
+    # -------------------------------------------------
     result = docker_compose_up(project)
     if not result.ok:
         return WorkflowResult.failure(
@@ -84,7 +93,9 @@ def start_environment(
     mark_mysql_initialized(project)
     steps.append("MySQL marked as initialized")
 
+    # -------------------------------------------------
     # Optional health check
+    # -------------------------------------------------
     if wait_for_health:
         healthy = wait_for_service_healthy(
             project,
@@ -100,7 +111,27 @@ def start_environment(
 
         steps.append(f"Service '{health_service}' is healthy")
 
+    # -------------------------------------------------
+    # Optional Sail install
+    # -------------------------------------------------
+    if ensure_sail:
+        if sail_installed(project):
+            steps.append("Laravel Sail already installed")
+        else:
+            sail = install_sail(project)
+
+            if not sail.ok:
+                return WorkflowResult.failure(
+                    steps=steps,
+                    error="Failed to install Laravel Sail",
+                    result=sail,
+                )
+
+            steps.append("Laravel Sail installed")
+
+    # -------------------------------------------------
     # Optional migrations
+    # -------------------------------------------------
     if auto_migrate:
         mig = artisan(project, ["migrate"])
 

@@ -49,6 +49,7 @@ class UiOptions:
     overwrite_compose: bool
     update_env: bool
     auto_migrate: bool
+    ensure_sail: bool
     confirm_destructive: bool
 
 
@@ -92,6 +93,11 @@ with st.sidebar:
         auto_migrate=st.checkbox(
             "Run migrations after Docker up",
             value=True,
+        ),
+        ensure_sail=st.checkbox(
+            "Install Laravel Sail if missing",
+            value=False,
+            help="Installs laravel/sail via Composer if not already present",
         ),
         confirm_destructive=st.checkbox(
             "I understand this may delete data",
@@ -174,7 +180,10 @@ with col2:
     if st.button("Docker down"):
         try:
             with st.status("Stopping environment..."):
-                result = stop_environment(project, safety=safety)
+                result = stop_environment(
+                    project,
+                    safety=safety,
+                )
             render_workflow(result)
         except SafetyError as e:
             st.error(str(e))
@@ -188,6 +197,7 @@ with col3:
             result = start_environment(
                 project,
                 auto_migrate=options.auto_migrate,
+                ensure_sail=options.ensure_sail,
             )
         render_workflow(result)
 

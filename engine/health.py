@@ -11,7 +11,7 @@ HealthStatus = Literal[
     "healthy",
     "unhealthy",
     "starting",
-    "none",        # container exists but no healthcheck / metadata yet
+    "none",        # container exists but no healthcheck / no metadata yet
     "not_found",   # service/container not present yet
 ]
 
@@ -68,9 +68,11 @@ def get_service_health(
     if container is None:
         return "not_found"
 
+    # Container exists but Docker only returned its name (string)
     if isinstance(container, str):
         return "none"
 
+    # Container metadata exists
     if isinstance(container, dict):
         health = container.get("Health")
         if health is None:

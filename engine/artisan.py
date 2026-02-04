@@ -1,28 +1,46 @@
+from __future__ import annotations
+
 from pathlib import Path
-import subprocess
+from typing import Sequence
+
+from engine.docker import CommandResult, _run
 
 
-def artisan(project: Path, args: list[str]) -> tuple[bool, str]:
+def artisan(
+    project: Path,
+    args: Sequence[str],
+    *,
+    timeout: int = 120,
+) -> CommandResult:
     """
     Run a Laravel artisan command inside the app container.
+
+    This function assumes:
+    - Docker Compose services are already running
+    - The service name is `app`
+    - PHP and artisan are available in the container
+
+    It does NOT:
+    - Start containers
+    - Retry failures
+    - Interpret artisan output
     """
-    cmd = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",  # no TTY (important for Streamlit)
-        "app",
-        "php",
-        "artisan",
-        *args,
-    ]
+    if not args:
+        return CommandResult.failure(
+            stderr="No artisan command provided",
+        )
 
-    p = subprocess.run(
-        cmd,
+    return _run(
+        [
+            "docker",
+            "compose",
+            "exec",
+            "-T",  # no TTY (important for Streamlit / CI)
+            "app",
+            "php",
+            "artisan",
+            *args,
+        ],
         cwd=project,
-        capture_output=True,
-        text=True,
+        timeout=timeout,
     )
-
-    out = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-    return p.returncode == 0, out.strip()

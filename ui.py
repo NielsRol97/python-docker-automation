@@ -1,70 +1,109 @@
 import streamlit as st
 from pathlib import Path
+from dataclasses import dataclass
 
-from engine.laravel import list_laravel_projects, ensure_env_defaults
-from engine.templates import (
-    docker_compose_yml,
-    nginx_default_conf,
-    php_dockerfile,
-    php_ini_overrides,
+from engine.laravel import list_laravel_projects
+from engine.docker import mysql_volume_exists
+from engine.fs import MountError
+from engine.app import generate_docker_files
+from engine.workflows import (
+    start_environment,
+    stop_environment,
+    reset_database,
+    WorkflowResult,
 )
-from engine.docker import (
-    docker_compose_up,
-    docker_compose_down,
-    mysql_volume_exists,
-    mark_mysql_initialized,
-)
-from engine.artisan import artisan
-from engine.fs import ensure_file, ensure_directory, MountError, safe_backup
+from engine.safety import SafetyContext, SafetyError
 
 
 # -------------------------------------------------
-# Helpers
+# UI helpers
 # -------------------------------------------------
 def normalize_projects_path(path: Path) -> Path:
-    """
-    Prevent paths like /projects/projects by collapsing duplicates.
-    """
     parts = list(path.parts)
     if len(parts) >= 2 and parts[-1] == parts[-2]:
         return Path(*parts[:-1])
     return path
 
 
+def render_workflow(result: WorkflowResult) -> None:
+    for step in result.steps:
+        st.info(step)
+
+    if result.result:
+        if result.result.stdout:
+            st.code(result.result.stdout)
+        if result.result.stderr:
+            st.code(result.result.stderr, language="text")
+
+    if result.ok:
+        st.success("Workflow completed successfully 🚀")
+    else:
+        st.error(result.error or "Workflow failed")
+
+
 # -------------------------------------------------
-# UI setup
+# UI state
 # -------------------------------------------------
-st.set_page_config(page_title="Laravel Docker Setup", layout="wide")
+@dataclass(frozen=True)
+class UiOptions:
+    overwrite_compose: bool
+    update_env: bool
+    auto_migrate: bool
+    confirm_destructive: bool
+
+
+# -------------------------------------------------
+# Page setup
+# -------------------------------------------------
+st.set_page_config(
+    page_title="Laravel Docker Setup",
+    page_icon="🐳",
+    layout="wide",
+)
+
 st.title("🐳 Laravel Docker Setup Automator")
-st.caption("Docker-powered Laravel dev environment")
+st.subheader("A safe, repeatable Docker environment for Laravel projects")
+st.markdown("---")
 
 
 # -------------------------------------------------
 # Sidebar
 # -------------------------------------------------
 with st.sidebar:
-    st.header("📁 Projects folder")
+    st.header("📁 Project discovery")
 
     projects_dir = st.text_input(
-        "Path to your projects directory",
+        "Projects root directory",
         value=str((Path.cwd() / "../").resolve()),
     )
 
     st.divider()
-    st.header("⚙️ Options")
+    st.header("⚙️ Setup options")
 
-    overwrite_compose = st.checkbox("Overwrite docker-compose.yml", value=True)
-    update_env = st.checkbox("Ensure .env defaults", value=True)
-    auto_disable_compose_yaml = st.checkbox("Disable compose.yaml", value=True)
-    auto_migrate = st.checkbox("Run migrations on startup", value=True)
+    options = UiOptions(
+        overwrite_compose=st.checkbox(
+            "Overwrite docker-compose.yml",
+            value=True,
+        ),
+        update_env=st.checkbox(
+            "Ensure .env defaults",
+            value=True,
+        ),
+        auto_migrate=st.checkbox(
+            "Run migrations after Docker up",
+            value=True,
+        ),
+        confirm_destructive=st.checkbox(
+            "I understand this may delete data",
+            value=False,
+        ),
+    )
 
 
 # -------------------------------------------------
-# Project discovery (SAFE)
+# Project discovery
 # -------------------------------------------------
-root = normalize_projects_path(
-    Path(projects_dir).expanduser().resolve()
-)
+root = normalize_projects_path(Path(projects_dir).expanduser().resolve())
 
 if not root.exists():
     st.error(f"Folder does not exist: {root}")
@@ -77,141 +116,116 @@ if not projects:
     st.stop()
 
 project = st.selectbox(
-    "Select a Laravel project",
+    "Laravel project",
     projects,
     format_func=lambda p: p.name,
 )
 
-st.success(f"Selected project: {project.name}")
+st.success(f"Using project: **{project.name}**")
 
 
 # -------------------------------------------------
-# Paths
-# -------------------------------------------------
-compose_path = project / "docker-compose.yml"
-compose_yaml = project / "compose.yaml"
-
-docker_dir = project / "docker"
-nginx_dir = docker_dir / "nginx"
-php_dir = docker_dir / "php"
-
-nginx_conf = nginx_dir / "default.conf"
-php_dockerfile_path = php_dir / "Dockerfile"
-php_ini_path = php_dir / "zz-overrides.ini"
-
-
-# -------------------------------------------------
-# Non-destructive warnings
+# Warnings
 # -------------------------------------------------
 if mysql_volume_exists(project):
     st.warning(
         "⚠️ Existing MySQL data detected.\n\n"
-        "If credentials changed, consider running:\n"
-        "`docker compose down -v`"
+        "Destructive actions require confirmation."
     )
-
-if compose_yaml.exists():
-    st.warning(
-        "⚠️ compose.yaml found — Docker prefers this over docker-compose.yml"
-    )
-
-    if auto_disable_compose_yaml:
-        backup = compose_yaml.with_suffix(".yaml.bak")
-        compose_yaml.rename(backup)
-        st.info(f"Renamed compose.yaml → {backup.name}")
 
 
 # -------------------------------------------------
-# Actions (ALL side effects live here)
+# Main actions
 # -------------------------------------------------
-col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+st.markdown("---")
+col1, col2, col3, col4 = st.columns([1.2, 1, 1.2, 1.6])
+
+safety = SafetyContext(
+    project=project,
+    confirmed=options.confirm_destructive,
+)
 
 
 # ---------- Generate files ----------
 with col1:
-    if st.button("🧱 Generate files", type="primary"):
+    st.markdown("### 🧱 Files")
+    if st.button("Generate Docker files", type="primary"):
         try:
-            # Directories
-            ensure_directory(docker_dir)
-            ensure_directory(nginx_dir)
-            ensure_directory(php_dir)
+            with st.status("Generating configuration files..."):
+                actions = generate_docker_files(
+                    project,
+                    overwrite_compose=options.overwrite_compose,
+                    update_env=options.update_env,
+                )
 
-            # Files
-            ensure_file(nginx_conf, nginx_default_conf())
-            ensure_file(php_dockerfile_path, php_dockerfile())
-            ensure_file(php_ini_path, php_ini_overrides())
+            for action in actions:
+                st.info(action)
 
-            # docker-compose.yml
-            if compose_path.exists() and overwrite_compose:
-                backup = safe_backup(compose_path)
-                st.info(f"Backed up docker-compose.yml → {backup.name}")
-
-            compose_path.write_text(
-                docker_compose_yml(project.name),
-                encoding="utf-8",
-            )
-
-            # .env
-            if update_env:
-                ensure_env_defaults(project)
-
-            st.success("Files generated successfully")
+            st.success("Docker configuration ready")
 
         except MountError as e:
             st.error("Filesystem validation failed")
             st.code(str(e))
-            st.stop()
 
 
-# ---------- Docker down ----------
+# ---------- Stop ----------
 with col2:
-    if st.button("🧨 Docker down"):
-        ok, out = docker_compose_down(project)
-        st.code(out)
-        st.success("Containers stopped" if ok else "Failed")
+    st.markdown("### 🧨 Stop")
+    if st.button("Docker down"):
+        try:
+            with st.status("Stopping environment..."):
+                result = stop_environment(project, safety=safety)
+            render_workflow(result)
+        except SafetyError as e:
+            st.error(str(e))
 
 
-# ---------- Docker up ----------
+# ---------- Start ----------
 with col3:
-    if st.button("🚀 Docker up"):
-        ok, out = docker_compose_up(project)
-        st.code(out)
-
-        if ok:
-            mark_mysql_initialized(project)
-
-            if auto_migrate:
-                ok_m, out_m = artisan(project, ["migrate"])
-                st.code(out_m)
-
-            st.success("Environment ready 🚀")
-        else:
-            st.error("Docker failed — see output above")
+    st.markdown("### 🚀 Start")
+    if st.button("Docker up"):
+        with st.status("Starting environment...", expanded=True):
+            result = start_environment(
+                project,
+                auto_migrate=options.auto_migrate,
+            )
+        render_workflow(result)
 
 
-# ---------- Database tools ----------
+# ---------- Database ----------
 with col4:
-    st.subheader("🧬 Database")
-
-    if st.button("Run migrations"):
-        ok, out = artisan(project, ["migrate"])
-        st.code(out)
-        st.success("Migrations complete" if ok else "Migration failed")
+    st.markdown("### 🧬 Database tools")
 
     if st.button("Migrate fresh"):
-        ok, out = artisan(project, ["migrate:fresh"])
-        st.code(out)
+        try:
+            with st.status("Resetting database..."):
+                result = reset_database(
+                    project,
+                    seed=False,
+                    safety=safety,
+                )
+            render_workflow(result)
+        except SafetyError as e:
+            st.error(str(e))
 
-    if st.button("Seed database"):
-        ok, out = artisan(project, ["db:seed"])
-        st.code(out)
+    if st.button("Migrate fresh + seed"):
+        try:
+            with st.status("Resetting & seeding database..."):
+                result = reset_database(
+                    project,
+                    seed=True,
+                    safety=safety,
+                )
+            render_workflow(result)
+        except SafetyError as e:
+            st.error(str(e))
 
 
 # -------------------------------------------------
 # Footer
 # -------------------------------------------------
-st.divider()
+st.markdown("---")
 st.caption(
-    "Filesystem mounts are validated before Docker runs "
-    "to prevent file/dir binding errors."
+    "🔒 Destructive actions require explicit confirmation.\n\n"
+    "UI declares intent only — workflows enforce safety."
 )
